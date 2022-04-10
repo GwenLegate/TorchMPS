@@ -4,6 +4,7 @@ TODO:
 """
 import torch
 import torch.nn as nn
+import math
 
 from .utils import init_tensor, svd_flex
 from .contractables import (
@@ -342,7 +343,7 @@ class MPS(nn.Module):
         input_dim,
         output_dim,
         bond_dim,
-        feature_dim=2,
+        feature_dim,
         periodic_bc=False,
         parallel_eval=False,
         label_site=None,
@@ -450,7 +451,7 @@ class MPS(nn.Module):
         self.merge_threshold = merge_threshold
         self.feature_map = None
 
-    def forward(self, input_data):
+    def forward(self, input_data, embedding):
         """
         Embed our data and pass it to an MPS with a single output site
 
@@ -466,6 +467,8 @@ class MPS(nn.Module):
                                  slice a certain subregion of input_data. This
                                  can be used to define multiple MPS 'strings',
                                  which act on different parts of the input.
+            embedding (Int):     Specifies embedding to use, default is [x, 1-x].
+                                 Embedding=1 is [cos(pi/2*x), sin(pi/2*x)]
         """
         # For custom paths, rearrange our input into the desired order
         if self.path:
@@ -475,7 +478,7 @@ class MPS(nn.Module):
             input_data = torch.stack(path_inputs, dim=1)
 
         # Embed our input data before feeding it into our linear region
-        input_data = self.embed_input(input_data)
+        input_data = self.embed_input(input_data, embedding)
         output = self.linear_region(input_data)
 
         # If we got a tuple as output, then use the last two entries to
@@ -493,7 +496,7 @@ class MPS(nn.Module):
 
         return output
 
-    def embed_input(self, input_data):
+    def embed_input(self, input_data, embedding):
         """
         Embed pixels of input_data into separate local feature spaces
 
@@ -502,6 +505,8 @@ class MPS(nn.Module):
                                     [batch_size, input_dim, feature_dim]. In the
                                     latter case, the data is assumed to already
                                     be embedded, and is returned unchanged.
+            embedding (Int):        Specifies embedding to use, default is [x, 1-x].
+                                    Embedding=1 is [cos(pi/2*x), sin(pi/2*x)]
 
         Returns:
             embedded_data (Tensor): Input embedded into a tensor with shape
@@ -540,7 +545,15 @@ class MPS(nn.Module):
                     "but default feature_map requires self.feature_dim = 2"
                 )
 
-            embedded_data = torch.stack([input_data, 1 - input_data], dim=2)
+            if embedding == 1:
+                # feature map: [cos(pi/2 * x), sin(pi/2 * x)]
+                embedded_data = torch.stack(
+                    [torch.cos((math.pi / 2) * input_data), torch.sin((math.pi / 2) * input_data)], dim=2)
+            else:
+                # feature map: [x, 1-x] (default embedding)
+                embedded_data = torch.stack([input_data, 1 - input_data], dim=2)
+
+
 
         return embedded_data
 

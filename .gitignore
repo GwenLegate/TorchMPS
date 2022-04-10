@@ -9,9 +9,11 @@ pyproject.toml
 __pycache__/
 .hypothesis/
 sublime/
+.idea/
 
 # Misc. files
 .coverage
 
 # Local MNIST download
 mnist/
+fashion_mnist/

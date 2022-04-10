@@ -9,17 +9,19 @@ torch.manual_seed(0)
 start_time = time.time()
 
 # MPS parameters
-bond_dim = 20
+bond_dim = 10
 adaptive_mode = False
 periodic_bc = False
 
 # Training parameters
-num_train = 2000
-num_test = 1000
+num_train = 60000
+num_test = 10000
 batch_size = 100
-num_epochs = 20
+num_epochs = 5
 learn_rate = 1e-4
 l2_reg = 0.0
+feature_dim = 2
+embedding = 1
 
 # Initialize the MPS module
 mps = MPS(
@@ -28,6 +30,7 @@ mps = MPS(
     bond_dim=bond_dim,
     adaptive_mode=adaptive_mode,
     periodic_bc=periodic_bc,
+    feature_dim=feature_dim,
 )
 
 # Set our loss function and optimizer
@@ -36,8 +39,13 @@ optimizer = torch.optim.Adam(mps.parameters(), lr=learn_rate, weight_decay=l2_re
 
 # Get the training and test sets
 transform = transforms.ToTensor()
-train_set = datasets.MNIST("./mnist", download=True, transform=transform)
-test_set = datasets.MNIST("./mnist", download=True, transform=transform, train=False)
+#MNIST
+#train_set = datasets.MNIST("./mnist", download=True, transform=transform)
+#test_set = datasets.MNIST("./mnist", download=True, transform=transform, train=False)
+#fashion MNIST option
+train_set = datasets.FashionMNIST("./fashion_mnist", download=True, transform=transform)
+test_set = datasets.FashionMNIST("./fashion_mnist", download=True, transform=transform, train=False)
+
 
 # Put MNIST data into dataloaders
 samplers = {
@@ -76,7 +84,7 @@ for epoch_num in range(1, num_epochs + 1):
         inputs, labels = inputs.view([batch_size, 28 ** 2]), labels.data
 
         # Call our MPS to get logit scores and predictions
-        scores = mps(inputs)
+        scores = mps(inputs, embedding)
         _, preds = torch.max(scores, 1)
 
         # Compute the loss and accuracy, add them to the running totals
