@@ -9,7 +9,7 @@ torch.manual_seed(0)
 start_time = time.time()
 
 # MPS parameters
-bond_dim = 10
+bond_dim = 20
 adaptive_mode = False
 periodic_bc = False
 
@@ -19,10 +19,18 @@ num_train = 50000 # 60000 MNIST, 50000 cifar
 num_test = 10000
 batch_size = 100
 num_epochs = 20
-learn_rate = 1e-4
+learn_rate = 1e-5
 l2_reg = 0.0
 feature_dim = 6
 embedding = 6
+
+# Check for GPU, if no GPU, use CPU
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
+    print("Running on the GPU")
+else:
+    device = torch.device("cpu")
+    print("Running on the CPU")
 
 # Initialize the MPS module
 mps = MPS(
