@@ -14,18 +14,19 @@ adaptive_mode = False
 periodic_bc = False
 
 # Training parameters
-num_train = 60000
+input_dim = 32 ** 2 # 28 ** 2 MNIST, 32 ** 2 cifar
+num_train = 50000 # 60000 MNIST, 50000 cifar
 num_test = 10000
 batch_size = 100
-num_epochs = 5
+num_epochs = 20
 learn_rate = 1e-4
 l2_reg = 0.0
-feature_dim = 2
-embedding = 1
+feature_dim = 6
+embedding = 6
 
 # Initialize the MPS module
 mps = MPS(
-    input_dim=28 ** 2,
+    input_dim=input_dim,
     output_dim=10,
     bond_dim=bond_dim,
     adaptive_mode=adaptive_mode,
@@ -42,10 +43,14 @@ transform = transforms.ToTensor()
 #MNIST
 #train_set = datasets.MNIST("./mnist", download=True, transform=transform)
 #test_set = datasets.MNIST("./mnist", download=True, transform=transform, train=False)
-#fashion MNIST option
-train_set = datasets.FashionMNIST("./fashion_mnist", download=True, transform=transform)
-test_set = datasets.FashionMNIST("./fashion_mnist", download=True, transform=transform, train=False)
 
+#fashion MNIST
+#train_set = datasets.FashionMNIST("./fashion_mnist", download=True, transform=transform)
+#test_set = datasets.FashionMNIST("./fashion_mnist", download=True, transform=transform, train=False)
+
+#cifar10
+train_set = datasets.CIFAR10("./cifar", train=True, download=True, transform=transform)
+test_set = datasets.CIFAR10("./cifar", train=False, download=True, transform=transform)
 
 # Put MNIST data into dataloaders
 samplers = {
@@ -64,7 +69,7 @@ num_batches = {
 }
 
 print(
-    f"Training on {num_train} MNIST images \n"
+    f"Training on {num_train} images \n"
     f"(testing on {num_test}) for {num_epochs} epochs"
 )
 print(f"Maximum MPS bond dimension = {bond_dim}")
@@ -81,7 +86,10 @@ for epoch_num in range(1, num_epochs + 1):
     running_acc = 0.0
 
     for inputs, labels in loaders["train"]:
-        inputs, labels = inputs.view([batch_size, 28 ** 2]), labels.data
+        try:
+            inputs, labels = inputs.view([batch_size, 28 ** 2]), labels.data
+        except:
+            inputs, labels = inputs.view([batch_size, 32 ** 2, 3]), labels.data
 
         # Call our MPS to get logit scores and predictions
         scores = mps(inputs, embedding)
@@ -108,10 +116,14 @@ for epoch_num in range(1, num_epochs + 1):
         running_acc = 0.0
 
         for inputs, labels in loaders["test"]:
-            inputs, labels = inputs.view([batch_size, 28 ** 2]), labels.data
+            try:
+                inputs, labels = inputs.view([batch_size, 28 ** 2]), labels.data
+            except:
+                inputs, labels = inputs.view([batch_size, 32 ** 2, 3]), labels.data
+
 
             # Call our MPS to get logit scores and predictions
-            scores = mps(inputs)
+            scores = mps(inputs, embedding)
             _, preds = torch.max(scores, 1)
             running_acc += torch.sum(preds == labels).item() / batch_size
 

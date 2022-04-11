@@ -496,6 +496,15 @@ class MPS(nn.Module):
 
         return output
 
+    def pre_embed_cifar(self, input_data):
+        input_cos = torch.cos((math.pi / 2) * input_data)
+        input_sin = torch.sin((math.pi / 2) * input_data)
+        output =  torch.stack(
+            [input_cos[:, :, 0], input_sin[:, :, 0], input_cos[:, :, 1], input_sin[:, :, 1], input_cos[:, :, 2],
+             input_sin[:, :, 2]], dim=2)
+        return output
+
+
     def embed_input(self, input_data, embedding):
         """
         Embed pixels of input_data into separate local feature spaces
@@ -514,6 +523,10 @@ class MPS(nn.Module):
         """
         assert len(input_data.shape) in [2, 3]
         assert input_data.size(1) == self.input_dim
+
+        # pre embed cifar
+        if self.feature_dim == 6:
+            input_data = self.pre_embed_cifar(input_data)
 
         # If input already has a feature dimension, return it as is
         if len(input_data.shape) == 3:
@@ -552,8 +565,6 @@ class MPS(nn.Module):
             else:
                 # feature map: [x, 1-x] (default embedding)
                 embedded_data = torch.stack([input_data, 1 - input_data], dim=2)
-
-
 
         return embedded_data
 
