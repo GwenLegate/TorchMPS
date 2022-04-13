@@ -313,7 +313,6 @@ class MatRegion(Contractable):
         # Since we only have a single matrix, wrap it as a SingleMat
         return SingleMat(mats.squeeze(1))
 
-
 class OutputCore(Contractable):
     """
     A single MPS core with a single output index

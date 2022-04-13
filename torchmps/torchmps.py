@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import math
 
-from .utils import init_tensor, svd_flex
+from .utils import init_tensor, svd_flex, init_mps_for_peps_tensor
 from .contractables import (
     SingleMat,
     MatRegion,
@@ -273,6 +273,222 @@ class TI_MPS(nn.Module):
 
         self.feature_map = feature_map
 
+class PEPS(nn.Module):
+    """
+    My adaptation of the MPS model class to a PEPS
+
+    Model works by first converting each 'pixel' (local data) to feature
+    vector via a simple embedding, then contracting embeddings with inputs
+    to each PEPS core. The resulting transition matrices are contracted
+    together as described in (Cheng, Song, Lei Wang, and Pan Zhang.
+    "Supervised learning with projected entangled pair states." Physical
+     Review B 103.12 (2021): 125117.) along bond dimensions (i.e. hidden
+      state spaces), with output produced via an uncontracted edge of
+      an additional output core in the center of the PEPS.
+
+    Args:
+        input_dim:       Number of 'pixels' in the input to the PEPS
+        output_dim:      Size of the vectors output by MPS via output core
+        bond_dim:        Dimension of the 'bonds' connecting adjacent PEPS
+                         cores, which act as hidden state spaces of the
+                         model. **No adaptive mode!!
+        feature_dim:     Size of the local feature spaces each pixel is
+                         embedded into (default: 2)
+        parallel_eval:   Whether contraction of tensors is performed in a
+                         serial or parallel fashion. The former is less
+                         expensive for open boundary conditions, but
+                         parallelizes more poorly (default: False)
+        label_site:      Location in the PEPS 2D lattice where output is placed
+                         (default: (input_dim // 2, input_dim // 2) )
+        init_std:        Size of the Gaussian noise used in default
+                         near-identity initialization (default: 1e-9)
+        use_bias:        Whether to use trainable bias matrices in MPS
+                         cores, which are initialized near the zero matrix
+                         (default: False)
+    """
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        bond_dim,
+        feature_dim,
+        parallel_eval=False,
+        label_site=None,
+        init_std=1e-9,
+        use_bias=True,
+    ):
+        super().__init__()
+
+        if label_site is None:
+            label_site = input_dim // 2
+        assert label_site >= 0 and label_site <= input_dim
+
+        # The PEPS is made of two BorderRegions sandwiching input_dim - 3 CenterRegions and one CenterOutputRegion.
+        # Each of these regions are MPS but with more bond dimension connections and the label site only on the center MPS
+
+        # Initialize all the MPS required
+        mps_list = []
+        for i in range(input_dim):
+            module_list = []
+
+            if i == 0 or i == input_dim - 1:
+                init_args = {
+                    "shape": [label_site, bond_dim, bond_dim, bond_dim, feature_dim],
+                    "bond_str": "sulri",
+                    "type": "edge"
+                }
+            else:
+                init_args = {
+                    "shape": [label_site, bond_dim, bond_dim, bond_dim, bond_dim, feature_dim],
+                    "bond_str": "sulrdi",
+                    "type": "center"
+                }
+
+            # The first input region
+            if label_site > 0:
+                tensor = init_mps_for_peps_tensor(**init_args)
+                if i == 0 or i == input_dim - 1:
+                    module_list.append(InputRegionPEPSEdge(tensor, use_bias=use_bias, fixed_bias=False))
+                else:
+                    module_list.append(InputRegionPEPSCenter(tensor, use_bias=use_bias, fixed_bias=False))
+
+            # The output site
+            if i == label_site:
+                tensor = init_mps_for_peps_tensor(
+                    shape=[output_dim, bond_dim, bond_dim, bond_dim, bond_dim],
+                    bond_str="oulrd",
+                    type="center"
+                )
+                module_list.append(OutputSitePeps(tensor))
+
+            elif i == 0 or i == input_dim - 1:
+                tensor = init_mps_for_peps_tensor([bond_dim, bond_dim, bond_dim], "ulr", type="edge" )
+                module_list.append(OutputSitePeps(tensor))
+            else:
+                tensor = init_mps_for_peps_tensor([bond_dim, bond_dim, bond_dim, bond_dim], "ulrd", type="center")
+                module_list.append(OutputSitePeps(tensor))
+
+            # The other input region
+            if label_site > 0:
+                tensor = init_mps_for_peps_tensor(**init_args)
+                if i == 0 or i == input_dim - 1:
+                    module_list.append(InputRegionPEPSEdge(tensor, use_bias=use_bias, fixed_bias=False))
+                else:
+                    module_list.append(InputRegionPEPSCenter(tensor, use_bias=use_bias, fixed_bias=False))
+
+            linear_region = LinearRegion(
+                module_list=module_list,
+                periodic_bc=False,
+                parallel_eval=parallel_eval,
+            )
+            assert len(linear_region) == input_dim
+            mps_list.append(linear_region)
+
+        self.lattice = Lattice(mps_list=mps_list)
+        assert len(self.lattice) == input_dim ** 2
+
+        # Set the rest of our PEPS attributes
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.bond_dim = bond_dim
+        self.feature_dim = feature_dim
+        self.label_site = label_site
+        self.use_bias = use_bias
+
+    def forward(self, input_data, embedding):
+        """
+        Embed our data and pass it to a PEPS with a single output site
+
+        Args:
+            input_data (Tensor): Input with shape [batch_size, input_dim] or
+                                 [batch_size, input_dim, feature_dim]. In the
+                                 former case, the data points are turned into
+                                 2D vectors using a default linear feature map.
+
+                                 When using a user-specified path, the size of
+                                 the second tensor mode need not exactly equal
+                                 input_dim, since the path variable is used to
+                                 slice a certain subregion of input_data. This
+                                 can be used to define multiple MPS 'strings',
+                                 which act on different parts of the input.
+            embedding (Int):     Specifies embedding to use, default is [x, 1-x].
+                                 Embedding=1 is [cos(pi/2*x), sin(pi/2*x)]
+        """
+        # Embed our input data before feeding it into our linear region
+        input_data = self.embed_input(input_data, embedding)
+        output = self.lattice(input_data)
+
+        return output
+
+    def pre_embed_cifar(self, input_data):
+        input_cos = torch.cos((math.pi / 2) * input_data)
+        input_sin = torch.sin((math.pi / 2) * input_data)
+        output = torch.stack(
+            [input_cos[:, :, 0], input_sin[:, :, 0], input_cos[:, :, 1], input_sin[:, :, 1], input_cos[:, :, 2],
+             input_sin[:, :, 2]], dim=2)
+        return output
+
+
+    def embed_input(self, input_data, embedding):
+        """
+        Embed pixels of input_data into separate local feature spaces
+
+        Args:
+            input_data (Tensor):    Input with shape [batch_size, input_dim, input_dim], or
+                                    [batch_size, input_dim, input_dim, feature_dim]. In the
+                                    latter case, the data is assumed to already be embedded,
+                                    and is returned unchanged.
+            embedding (Int):        Specifies embedding to use, default is [x, 1-x].
+                                    Embedding=1 is [cos(pi/2*x), sin(pi/2*x)]
+
+        Returns:
+            embedded_data (Tensor): Input embedded into a tensor with shape
+                                    [batch_size, input_dim, input_dim, feature_dim]
+        """
+        assert len(input_data.shape) in [2, 3]
+        assert input_data.size(1) == self.input_dim ** 2
+
+        # pre embed cifar
+        if self.feature_dim == 6:
+            input_data = self.pre_embed_cifar(input_data)
+
+            # If input already has a feature dimension, return it as is
+            if len(input_data.shape) == 3:
+                if input_data.size(2) != self.feature_dim:
+                    raise ValueError(
+                        f"input_data has wrong shape to be unembedded "
+                        "or pre-embedded data (input_data.shape = "
+                        f"{list(input_data.shape)}, feature_dim = {self.feature_dim})"
+                    )
+                return input_data
+
+        if self.feature_dim != 2:
+            raise RuntimeError(
+                f"self.feature_dim = {self.feature_dim}, "
+                "but default feature_map requires self.feature_dim = 2"
+            )
+
+        if embedding == 1:
+            # feature map: [cos(pi/2 * x), sin(pi/2 * x)]
+            embedded_data = torch.stack(
+                [torch.cos((math.pi / 2) * input_data), torch.sin((math.pi / 2) * input_data)], dim=2)
+        else:
+            # feature map: [x, 1-x] (default embedding)
+            embedded_data = torch.stack([input_data, 1 - input_data], dim=2)
+
+        return embedded_data
+
+    def core_len(self):
+        """
+        Returns the number of cores, which is at least the required input size
+        """
+        return self.linear_region.core_len()
+
+    def __len__(self):
+        """
+        Returns the number of input sites, which equals the input size
+        """
+        return self.input_dim
 
 class MPS(nn.Module):
     """
@@ -493,7 +709,6 @@ class MPS(nn.Module):
                     assert new_svs[i] is not None
                     self.bond_list[i] = bond_dim
                     self.sv_list[i] = new_svs[i]
-
         return output
 
     def pre_embed_cifar(self, input_data):
@@ -605,6 +820,117 @@ class MPS(nn.Module):
         """
         return self.input_dim
 
+class Lattice(nn.Module):
+    """
+    List of MPS which feeds input to each MPS and contracts lattice structure along the column
+    dimension until there is only one final MPS remaining  which can be handled by the previous
+    MPS contraction methods
+    """
+
+    def __init__(
+        self, mps_list, module_states=None
+    ):
+        super().__init__()
+
+        # Wrap as a ModuleList for proper parameter registration
+        self.mps_list = nn.ModuleList(mps_list)
+
+    def forward(self, input_data):
+        """
+        Contract input with list of MPS cores and return result as contractable
+
+        Args:
+            input_data (Tensor): Input with shape [batch_size, input_dim,
+                                                   feature_dim]
+        """
+        # Check that input_data has the correct shape
+        assert len(input_data.shape) == 3
+        assert input_data.size(1) == len(self)
+
+        # Whether to move intermediate vectors to a GPU (fixes Issue #8)
+        to_cuda = input_data.is_cuda
+        device = f"cuda:{input_data.get_device()}" if to_cuda else "cpu"
+
+        # For each MPS pass input data for that MPS and contract it
+        idx = 0
+        contracted_pieces = []
+        for mps in self.mps_list:
+            next_idx = idx + 28
+            data = input_data[:, idx:next_idx]
+            ind = 0
+            contract_data = []
+            for module in mps.module_list:
+                mod_len = len(module)
+                if mod_len == 1:
+                    mod_input = data[:, ind]
+                else:
+                    mod_input = data[:, ind: (ind + mod_len)]
+                ind += mod_len
+
+                contract_data.append(module(mod_input))
+            idx = next_idx
+            contracted_pieces.append(contract_data)
+
+        # contract from both ends along the col dimension
+        bottom = contracted_pieces[-1]
+        top = contracted_pieces[0]
+        for i in range(1, (len(contracted_pieces) // 2)):
+            j = i - (2 * i) - 1
+            top[0] = torch.einsum("bsulr, buslrd->bslrd", [top[0], contracted_pieces[i][0]])
+            bottom[0] = torch.einsum("bsulr, buslrd->bslrd", [bottom[0], contracted_pieces[j][0]])
+            top[1] = torch.einsum("ulr, ulrd->lrd", [top[1], contracted_pieces[i][1]])
+            top[2] = torch.einsum("bsulr, buslrd->bslrd", [top[2], contracted_pieces[i][2]])
+            bottom[2] = torch.einsum("bsulr, buslrd->bslrd", [bottom[2], contracted_pieces[j][2]])
+            if j == -14:
+                bottom[1] = torch.einsum("ulr, oulrd->olrd", [bottom[1], contracted_pieces[j][1]])
+            else:
+                bottom[1] = torch.einsum("ulr, ulrd->lrd", [bottom[1], contracted_pieces[j][1]])
+
+        # do final column concatenation, wrap as Contractibles and add to list
+        final_mps = []
+        final_mps.append(MatRegion(torch.einsum("bslrd, bslrd->bslr", [top[0], bottom[0]])))
+        final_mps.append(OutputCore(torch.einsum("lrd, olrd->olr", [top[1], bottom[1]])))
+        final_mps.append(MatRegion(torch.einsum("bslrd, bslrd->bslr", [top[2], bottom[2]])))
+
+        # Contract final mps with finite dimensions
+        lin_bonds = ["l", "r"]
+        # Get the dimension of left and right bond indices
+        end_items = [final_mps[i] for i in [0, -1]]
+        bond_strs = [item.bond_str for item in end_items]
+        bond_inds = [bs.index(c) for (bs, c) in zip(bond_strs, lin_bonds)]
+        bond_dims = [
+            item.tensor.size(ind) for (item, ind) in zip(end_items, bond_inds)
+        ]
+
+        # Build dummy end vectors and insert them at the ends of our list
+        end_vecs = [torch.zeros(dim).to(device) for dim in bond_dims]
+
+        for vec in end_vecs:
+            vec[0] = 1
+        final_mps.insert(0, EdgeVec(end_vecs[0], is_left_vec=True))
+        final_mps.append(EdgeVec(end_vecs[1], is_left_vec=False))
+
+        # Multiply together everything in contractable_list
+        final_mps = ContractableList(final_mps)
+        output = final_mps.reduce(parallel_eval=True)
+
+        return output.tensor
+
+    def core_len(self):
+        """
+        Returns the number of cores, which is at least the required input size
+        """
+        core_len = 0
+        for mps in self.mps_list:
+            core_len += sum([module.core_len() for module in mps])
+
+        return core_len
+
+    def __len__(self):
+        """
+        Returns the number of input sites, which is the required input size
+        """
+        return sum([len(module) for module in self.mps_list])
 
 class LinearRegion(nn.Module):
     """
@@ -1020,7 +1346,6 @@ class InputRegion(nn.Module):
         self, tensor, use_bias=True, fixed_bias=True, bias_mat=None, ephemeral=False
     ):
         super().__init__()
-
         # Make sure tensor has correct size and the component mats are square
         assert len(tensor.shape) == 4
         assert tensor.size(1) == tensor.size(2)
@@ -1070,7 +1395,6 @@ class InputRegion(nn.Module):
 
         # Contract the input with our core tensor
         mats = torch.einsum("slri,bsi->bslr", [tensor, input_data])
-
         # If we're using bias matrices, add those here
         if self.use_bias:
             bias_mat = self.bias_mat.unsqueeze(0)
@@ -1115,6 +1439,210 @@ class InputRegion(nn.Module):
 
         # Remove empty MergedInputs, which appear in very small InputRegions
         return [x for x in out_list if x is not None]
+
+    def __getitem__(self, key):
+        """
+        Returns an InputRegion instance sliced along the site index
+        """
+        assert isinstance(key, int) or isinstance(key, slice)
+
+        if isinstance(key, slice):
+            return InputRegion(self.tensor[key])
+        else:
+            return InputSite(self.tensor[key])
+
+    def get_norm(self):
+        """
+        Returns list of the norms of each core in InputRegion
+        """
+        return [torch.norm(core) for core in self.tensor]
+
+    @torch.no_grad()
+    def rescale_norm(self, scale_list):
+        """
+        Rescales the norm of each core by an amount specified in scale_list
+
+        For the i'th tensor defining a core in InputRegion, we rescale as
+        tensor_i <- scale_i * tensor_i, where scale_i = scale_list[i]
+        """
+        assert len(scale_list) == len(self.tensor)
+
+        for core, scale in zip(self.tensor, scale_list):
+            core *= scale
+
+    def core_len(self):
+        return len(self)
+
+    def __len__(self):
+        return self.tensor.size(0)
+
+class InputRegionPEPSEdge(nn.Module):
+    """
+    Contiguous region of PEPS input cores, associated with bond_str = 'sluri'
+    """
+
+    def __init__(
+        self, tensor, use_bias=True, fixed_bias=True, bias_mat=None, ephemeral=False
+    ):
+        super().__init__()
+
+        # Make sure tensor has correct size and the component mats are a cube
+        assert len(tensor.shape) == 5
+        assert tensor.size(1) == tensor.size(2) == tensor.size(3)
+        bond_dim = tensor.size(1)
+
+        # If we are using bias matrices, set those up here
+        if use_bias:
+            assert bias_mat is None or isinstance(bias_mat, torch.Tensor)
+            bias_mat = (
+                torch.eye(bond_dim).unsqueeze(0) if bias_mat is None else bias_mat
+            )
+
+            bias_modes = len(list(bias_mat.shape))
+            assert bias_modes in [2, 3]
+            if bias_modes == 2:
+                bias_mat = bias_mat.unsqueeze(0)
+
+        # Register our tensors as a Pytorch Parameter or Tensor
+        if ephemeral:
+            self.register_buffer(name="tensor", tensor=tensor.contiguous())
+            self.register_buffer(name="bias_mat", tensor=bias_mat)
+        else:
+            self.register_parameter(
+                name="tensor", param=nn.Parameter(tensor.contiguous())
+            )
+            if fixed_bias:
+                self.register_buffer(name="bias_mat", tensor=bias_mat)
+            else:
+                self.register_parameter(name="bias_mat", param=nn.Parameter(bias_mat))
+
+        self.use_bias = use_bias
+        self.fixed_bias = fixed_bias
+
+    def forward(self, input_data):
+        """
+        Contract input with MPS cores and return result
+
+        Args:
+            input_data (Tensor): Input with shape [batch_size, input_dim,
+                                                   feature_dim]
+        """
+        # Check that input_data has the correct shape
+        tensor = self.tensor
+        assert len(input_data.shape) == 3
+        assert input_data.size(1) == len(self)
+
+        # Contract the input with our core tensor
+        mats = torch.einsum("sulri,bsi->bsulr", [tensor, input_data])
+
+        # If we're using bias matrices, add those here
+        if self.use_bias:
+            bias_mat = self.bias_mat.unsqueeze(0)
+            mats = mats + bias_mat.expand_as(mats)
+
+        return mats
+
+    def __getitem__(self, key):
+        """
+        Returns an InputRegion instance sliced along the site index
+        """
+        assert isinstance(key, int) or isinstance(key, slice)
+
+        if isinstance(key, slice):
+            return InputRegion(self.tensor[key])
+        else:
+            return InputSite(self.tensor[key])
+
+    def get_norm(self):
+        """
+        Returns list of the norms of each core in InputRegion
+        """
+        return [torch.norm(core) for core in self.tensor]
+
+    @torch.no_grad()
+    def rescale_norm(self, scale_list):
+        """
+        Rescales the norm of each core by an amount specified in scale_list
+
+        For the i'th tensor defining a core in InputRegion, we rescale as
+        tensor_i <- scale_i * tensor_i, where scale_i = scale_list[i]
+        """
+        assert len(scale_list) == len(self.tensor)
+
+        for core, scale in zip(self.tensor, scale_list):
+            core *= scale
+
+    def core_len(self):
+        return len(self)
+
+    def __len__(self):
+        return self.tensor.size(0)
+
+class InputRegionPEPSCenter(nn.Module):
+    """
+    Contiguous region of PEPS input cores, associated with bond_str = 'slurdi'
+    """
+
+    def __init__(
+        self, tensor, use_bias=True, fixed_bias=True, bias_mat=None, ephemeral=False
+    ):
+        super().__init__()
+
+        # Make sure tensor has correct size and the component mats are a cube
+        assert len(tensor.shape) == 6
+        assert tensor.size(1) == tensor.size(2) == tensor.size(3) == tensor.size(4)
+        bond_dim = tensor.size(1)
+
+        # If we are using bias matrices, set those up here
+        if use_bias:
+            assert bias_mat is None or isinstance(bias_mat, torch.Tensor)
+            bias_mat = (
+                torch.eye(bond_dim).unsqueeze(0) if bias_mat is None else bias_mat
+            )
+
+            bias_modes = len(list(bias_mat.shape))
+            assert bias_modes in [2, 3]
+            if bias_modes == 2:
+                bias_mat = bias_mat.unsqueeze(0)
+
+        # Register our tensors as a Pytorch Parameter or Tensor
+        if ephemeral:
+            self.register_buffer(name="tensor", tensor=tensor.contiguous())
+            self.register_buffer(name="bias_mat", tensor=bias_mat)
+        else:
+            self.register_parameter(
+                name="tensor", param=nn.Parameter(tensor.contiguous())
+            )
+            if fixed_bias:
+                self.register_buffer(name="bias_mat", tensor=bias_mat)
+            else:
+                self.register_parameter(name="bias_mat", param=nn.Parameter(bias_mat))
+
+        self.use_bias = use_bias
+        self.fixed_bias = fixed_bias
+
+    def forward(self, input_data):
+        """
+        Contract input with MPS cores and return result as a MatRegion
+
+        Args:
+            input_data (Tensor): Input with shape [batch_size, input_dim,
+                                                   feature_dim]
+        """
+        # Check that input_data has the correct shape
+        tensor = self.tensor
+        assert len(input_data.shape) == 3
+        assert input_data.size(1) == len(self)
+
+        # Contract the input with our core tensor
+        mats = torch.einsum("sulrdi,bsi->buslrd", [tensor, input_data])
+
+        # If we're using bias matrices, add those here
+        if self.use_bias:
+            bias_mat = self.bias_mat.unsqueeze(0)
+            mats = mats + bias_mat.expand_as(mats)
+
+        return mats
 
     def __getitem__(self, key):
         """
@@ -1274,6 +1802,7 @@ class InputSite(nn.Module):
         Args:
             input_data (Tensor): Input with shape [batch_size, feature_dim]
         """
+        print('FORWARD input site (1636)')
         # Check that input_data has the correct shape
         tensor = self.tensor
         assert len(input_data.shape) == 2
@@ -1347,6 +1876,45 @@ class OutputSite(nn.Module):
     def __len__(self):
         return 0
 
+class OutputSitePeps(nn.Module):
+    """
+    A single MPS core with no input and a single output index, bond_str = 'oulr' or 'oulrd' for the central MPS
+    A single MPS core with no input and no output index, bond_str = 'ulr' or 'ulrd' for the rest of the MPS
+    """
+
+    def __init__(self, tensor):
+        super().__init__()
+        # Register our tensor as a Pytorch Parameter
+        self.register_parameter(name="tensor", param=nn.Parameter(tensor.contiguous()))
+
+    def forward(self, input_data):
+        """
+        Return self, no contraction
+        """
+        return self.tensor
+
+    def get_norm(self):
+        """
+        Returns the norm of our core tensor, wrapped as a singleton list
+        """
+        return [torch.norm(self.tensor)]
+
+    @torch.no_grad()
+    def rescale_norm(self, scale):
+        """
+        Rescales the norm of our core by a factor of input `scale`
+        """
+        if isinstance(scale, list):
+            assert len(scale) == 1
+            scale = scale[0]
+
+        self.tensor *= scale
+
+    def core_len(self):
+        return 1
+
+    def __len__(self):
+        return 0
 
 class MergedOutput(nn.Module):
     """
@@ -1378,6 +1946,7 @@ class MergedOutput(nn.Module):
         Args:
             input_data (Tensor): Input with shape [batch_size, feature_dim]
         """
+        print('FORWARD merged output (1745)')
         # Check that input_data has the correct shape
         tensor = self.tensor
         assert len(input_data.shape) == 2

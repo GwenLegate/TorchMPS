@@ -251,6 +251,34 @@ def init_tensor(shape, bond_str, init_method):
 
     return tensor
 
+def init_mps_for_peps_tensor(shape, bond_str, type):
+    """
+    Initialize a tensor with a given shape
+
+    Args:
+        shape:       The shape of our output parameter tensor.
+        bond_str:    The bond string describing our output parameter tensor,
+                     which is used in 'random_eye' initialization method.
+                     The characters 'l' and 'r' are used to refer to the
+                     left or right virtual indices of our tensor, and are
+                     both required to be present for the random_eye and
+                     min_random_eye initialization methods.
+        type:        The MPS type being initialized, "edge" or "center"
+    """
+    # Check that bond_str is properly sized and doesn't have repeat indices
+    assert len(shape) == len(bond_str)
+    assert len(set(bond_str)) == len(bond_str)
+
+    # Check edge has 3 bond dims (l,r,u) and center has 4 bond dims (l,r,u, d)
+    if not type == 'edge':
+        bond_chars = ["d"]
+        assert all([c in bond_str for c in bond_chars])
+    else:
+        bond_chars = ["d"]
+        assert all([c not in bond_str for c in bond_chars])
+
+    std = 1e-9
+    return std * torch.randn(shape)
 
 ### OLDER MISCELLANEOUS FUNCTIONS ###   # noqa: E266
 

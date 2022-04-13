@@ -1,3 +1,3 @@
-__all__ = ["ProbMPS", "ProbUnifMPS", "MPS", "TI_MPS"]
+__all__ = ["ProbMPS", "ProbUnifMPS", "MPS", "TI_MPS", "PEPS"]
 from .prob_mps import ProbMPS, ProbUnifMPS
-from .torchmps import MPS, TI_MPS
+from .torchmps import MPS, TI_MPS, PEPS

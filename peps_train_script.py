@@ -1,37 +1,33 @@
 #!/usr/bin/env python3
 import time
 import torch
-from torchmps import MPS
+from torchmps import PEPS
 from torchvision import transforms, datasets
 
 # Miscellaneous initialization
 torch.manual_seed(0)
 start_time = time.time()
 
-# MPS parameters
-bond_dim = 13
-adaptive_mode = False
-periodic_bc = False
+# PEPS parameters
+bond_dim = 10
 
 # Training parameters
-#input_dim = 32 ** 2 # cifar
-input_dim = 28 ** 2 # MNIST
+#input_dim = 32 # cifar
+input_dim = 28 # MNIST
 num_train = 50000 # 60000 MNIST, 50000 cifar
 num_test = 10000
 batch_size = 100
-num_epochs = 1
+num_epochs = 20
 learn_rate = 1e-5
 l2_reg = 0.0
 feature_dim = 2
-embedding = 2
+embedding = 0
 
 # Initialize the MPS module
-mps = MPS(
+peps = PEPS(
     input_dim=input_dim,
     output_dim=10,
     bond_dim=bond_dim,
-    adaptive_mode=adaptive_mode,
-    periodic_bc=periodic_bc,
     feature_dim=feature_dim,
 )
 
@@ -43,11 +39,11 @@ else:
     device = torch.device("cpu")
     print("Running on the CPU")
 
-mps.to(device)
+peps.to(device)
 
 # Set our loss function and optimizer
 loss_fun = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(mps.parameters(), lr=learn_rate, weight_decay=l2_reg)
+optimizer = torch.optim.Adam(peps.parameters(), lr=learn_rate, weight_decay=l2_reg)
 
 # Get the training and test sets
 transform = transforms.ToTensor()
@@ -83,9 +79,7 @@ print(
     f"Training on {num_train} images \n"
     f"(testing on {num_test}) for {num_epochs} epochs"
 )
-print(f"Maximum MPS bond dimension = {bond_dim}")
-print(f" * {'Adaptive' if adaptive_mode else 'Fixed'} bond dimensions")
-print(f" * {'Periodic' if periodic_bc else 'Open'} boundary conditions")
+print(f"Maximum PEPS bond dimension = {bond_dim}")
 print(f"Using Adam w/ learning rate = {learn_rate:.1e}")
 if l2_reg > 0:
     print(f" * L2 regularization = {l2_reg:.2e}")
@@ -100,10 +94,10 @@ for epoch_num in range(1, num_epochs + 1):
         try:
             inputs, labels = inputs.view([batch_size, 28 ** 2]).to(device), labels.data.to(device)
         except:
-            inputs, labels = inputs.view([batch_size, 32 ** 2, 3]).to(device), labels.data.to(device)
+            inputs, labels = inputs.view([batch_size, 28 ** 2]).to(device), labels.data.to(device)
 
         # Call our MPS to get logit scores and predictions
-        scores = mps(inputs, embedding)
+        scores = peps(inputs, embedding)
         _, preds = torch.max(scores, 1)
 
         # Compute the loss and accuracy, add them to the running totals
@@ -133,10 +127,13 @@ for epoch_num in range(1, num_epochs + 1):
                 inputs, labels = inputs.view([batch_size, 32 ** 2, 3]).to(device), labels.data.to(device)
 
 
-            # Call our MPS to get logit scores and predictions
-            scores = mps(inputs, embedding)
+            # Call our PEPS to get logit scores and predictions
+            scores = peps(inputs, embedding)
             _, preds = torch.max(scores, 1)
             running_acc += torch.sum(preds == labels).item() / batch_size
 
     print(f"Test accuracy:          {running_acc / num_batches['test']:.4f}")
     print(f"Runtime so far:         {int(time.time()-start_time)} sec\n")
+
+
+
