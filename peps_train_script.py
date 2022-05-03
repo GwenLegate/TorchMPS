@@ -9,15 +9,15 @@ torch.manual_seed(0)
 start_time = time.time()
 
 # PEPS parameters
-bond_dim = 7
+bond_dim = 3
 
 # Training parameters
 #input_dim = 32 # cifar
 input_dim = 28 # MNIST
-num_train = 50000 # 60000 MNIST, 50000 cifar
+num_train = 60000 # 60000 MNIST, 50000 cifar
 num_test = 10000
 batch_size = 100
-num_epochs = 40
+num_epochs = 10
 learn_rate = 1e-8
 l2_reg = 0.0
 feature_dim = 2
