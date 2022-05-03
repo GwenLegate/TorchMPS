@@ -9,7 +9,7 @@ torch.manual_seed(0)
 start_time = time.time()
 
 # PEPS parameters
-bond_dim = 10
+bond_dim = 7
 
 # Training parameters
 #input_dim = 32 # cifar
@@ -17,8 +17,8 @@ input_dim = 28 # MNIST
 num_train = 50000 # 60000 MNIST, 50000 cifar
 num_test = 10000
 batch_size = 100
-num_epochs = 20
-learn_rate = 1e-5
+num_epochs = 40
+learn_rate = 1e-8
 l2_reg = 0.0
 feature_dim = 2
 embedding = 0
@@ -94,7 +94,7 @@ for epoch_num in range(1, num_epochs + 1):
         try:
             inputs, labels = inputs.view([batch_size, 28 ** 2]).to(device), labels.data.to(device)
         except:
-            inputs, labels = inputs.view([batch_size, 28 ** 2]).to(device), labels.data.to(device)
+            inputs, labels = inputs.view([batch_size, 32 ** 2, 3]).to(device), labels.data.to(device)
 
         # Call our MPS to get logit scores and predictions
         scores = peps(inputs, embedding)
@@ -113,7 +113,7 @@ for epoch_num in range(1, num_epochs + 1):
         optimizer.step()
 
     print(f"### Epoch {epoch_num} ###")
-    print(f"Average loss:           {running_loss / num_batches['train']:.4f}")
+    print(f"Average loss:           {running_loss / num_batches['train']:.10f}")
     print(f"Average train accuracy: {running_acc / num_batches['train']:.4f}")
 
     # Evaluate accuracy of MPS classifier on the test set

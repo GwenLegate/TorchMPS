@@ -5,6 +5,7 @@ TODO:
 import torch
 import torch.nn as nn
 import math
+import tensornetwork as tn
 
 from .utils import init_tensor, svd_flex, init_mps_for_peps_tensor
 from .contractables import (
@@ -287,7 +288,9 @@ class PEPS(nn.Module):
       an additional output core in the center of the PEPS.
 
     Args:
-        input_dim:       Number of 'pixels' in the input to the PEPS
+        input_dim:       Number of 'pixels' in one row input to the PEPS
+                         assume the input is square
+                         TODO: generalize this so no square required
         output_dim:      Size of the vectors output by MPS via output core
         bond_dim:        Dimension of the 'bonds' connecting adjacent PEPS
                          cores, which act as hidden state spaces of the
@@ -323,10 +326,10 @@ class PEPS(nn.Module):
             label_site = input_dim // 2
         assert label_site >= 0 and label_site <= input_dim
 
-        # The PEPS is made of two BorderRegions sandwiching input_dim - 3 CenterRegions and one CenterOutputRegion.
-        # Each of these regions are MPS but with more bond dimension connections and the label site only on the center MPS
+        # The PEPS is made of two BorderRegions (MPS) sandwiching CenterRegions and one CenterOutputRegion (MPO).
+        # the label site is only on the center most MPO
 
-        # Initialize all the MPS required
+        # Initialize required MPSs and MPOs
         mps_list = []
         for i in range(input_dim):
             module_list = []
@@ -384,7 +387,7 @@ class PEPS(nn.Module):
             assert len(linear_region) == input_dim
             mps_list.append(linear_region)
 
-        self.lattice = Lattice(mps_list=mps_list)
+        self.lattice = Lattice(mps_list=mps_list, num_classes=output_dim, max_bd=bond_dim, output_site=label_site)
         assert len(self.lattice) == input_dim ** 2
 
         # Set the rest of our PEPS attributes
@@ -416,7 +419,7 @@ class PEPS(nn.Module):
         """
         # Embed our input data before feeding it into our linear region
         input_data = self.embed_input(input_data, embedding)
-        output = self.lattice(input_data)
+        output = self.lattice(input_data, self.input_dim)
 
         return output
 
@@ -625,6 +628,7 @@ class MPS(nn.Module):
 
         # Initialize linear_region according to our adaptive_mode specification
         if adaptive_mode:
+            print(f'adaptive so merging ln:631')
             self.linear_region = MergedLinearRegion(
                 module_list=module_list,
                 periodic_bc=periodic_bc,
@@ -822,23 +826,23 @@ class MPS(nn.Module):
 
 class Lattice(nn.Module):
     """
-    List of MPS which feeds input to each MPS and contracts lattice structure along the column
-    dimension until there is only one final MPS remaining  which can be handled by the previous
-    MPS contraction methods
+    List of MPS and MPO which feeds input to each MPS and contracts lattice structure using the boundary MPS method
+    until there is only one final MPS remaining  which can be handled by the previous MPS contraction methods
     """
 
     def __init__(
-        self, mps_list, module_states=None
+        self, mps_list, num_classes, max_bd, input_site, module_states=None
     ):
         super().__init__()
 
         # Wrap as a ModuleList for proper parameter registration
         self.mps_list = nn.ModuleList(mps_list)
+        self.num_classes = num_classes
+        self.max_bd = max_bd
+        self.input_site = input_site
 
-    def forward(self, input_data):
+    def forward(self, input_data, input_dim):
         """
-        Contract input with list of MPS cores and return result as contractable
-
         Args:
             input_data (Tensor): Input with shape [batch_size, input_dim,
                                                    feature_dim]
@@ -851,11 +855,11 @@ class Lattice(nn.Module):
         to_cuda = input_data.is_cuda
         device = f"cuda:{input_data.get_device()}" if to_cuda else "cpu"
 
-        # For each MPS pass input data for that MPS and contract it
+        # For each row of the PEPS pass input data for that row and contract it
         idx = 0
         contracted_pieces = []
         for mps in self.mps_list:
-            next_idx = idx + 28
+            next_idx = idx + input_dim
             data = input_data[:, idx:next_idx]
             ind = 0
             contract_data = []
@@ -871,26 +875,19 @@ class Lattice(nn.Module):
             idx = next_idx
             contracted_pieces.append(contract_data)
 
-        # contract from both ends along the col dimension
+        # contract from both ends along the col dimension reducing bond dim each time
         bottom = contracted_pieces[-1]
         top = contracted_pieces[0]
-        for i in range(1, (len(contracted_pieces) // 2)):
-            j = i - (2 * i) - 1
-            top[0] = torch.einsum("bsulr, buslrd->bslrd", [top[0], contracted_pieces[i][0]])
-            bottom[0] = torch.einsum("bsulr, buslrd->bslrd", [bottom[0], contracted_pieces[j][0]])
-            top[1] = torch.einsum("ulr, ulrd->lrd", [top[1], contracted_pieces[i][1]])
-            top[2] = torch.einsum("bsulr, buslrd->bslrd", [top[2], contracted_pieces[i][2]])
-            bottom[2] = torch.einsum("bsulr, buslrd->bslrd", [bottom[2], contracted_pieces[j][2]])
-            if j == -14:
-                bottom[1] = torch.einsum("ulr, oulrd->olrd", [bottom[1], contracted_pieces[j][1]])
-            else:
-                bottom[1] = torch.einsum("ulr, ulrd->lrd", [bottom[1], contracted_pieces[j][1]])
+        input_idx_from_bottom = self.input_site - len(contracted_pieces)
+        contracted_top = self.contract(top, contracted_pieces, self.input_site, 1, direction='top')
+        contracted_bottom = self.contract(bottom, contracted_pieces, input_idx_from_bottom, -2, direction='bottom')
 
-        # do final column concatenation, wrap as Contractibles and add to list
-        final_mps = []
-        final_mps.append(MatRegion(torch.einsum("bslrd, bslrd->bslr", [top[0], bottom[0]])))
-        final_mps.append(OutputCore(torch.einsum("lrd, olrd->olr", [top[1], bottom[1]])))
-        final_mps.append(MatRegion(torch.einsum("bslrd, bslrd->bslr", [top[2], bottom[2]])))
+        # get final mps after contraction
+        final_mps = self.final_contract(contracted_top, contracted_bottom, contracted_pieces[self.input_site])
+        # wrap final mps as Contractibles and add to list
+        final_mps[0] = MatRegion(final_mps[0])
+        final_mps[1] = OutputCore(final_mps[1])
+        final_mps[2] = MatRegion(final_mps[2])
 
         # Contract final mps with finite dimensions
         lin_bonds = ["l", "r"]
@@ -915,6 +912,353 @@ class Lattice(nn.Module):
         output = final_mps.reduce(parallel_eval=True)
 
         return output.tensor
+
+    def contract_mps_mpo(self, mps, mpo):
+        """
+            Returns the contraction of a MPS and an MPO for right or left side
+
+            Args:
+            mps (Tensor): right or left mps
+            mpo (Tensor): right or left mpo
+        """
+        # contracted dimensions
+        cores = mps.size()[1]
+        d = mpo.size()[5]
+        l = mps.size()[3] ** 2
+        r = mps.size()[4] ** 2
+
+        contract = torch.zeros((mps.size()[0], cores, l, r, d))
+        for i in range(mps.size()[1]):
+            result = torch.einsum("bupq, bughd->bpgqhd", mps[:, i, :, :, :], mpo[:, :, i, :, :, :])
+            # merge right bond dims
+            result = result.reshape((result.size()[0], -1, result.size()[3], result.size()[4], result.size()[5]))
+            # merge left bond dims
+            result = result.reshape((result.size()[0], result.size()[1], -1, result.size()[4]))
+            contract[:, i, :, :] = result
+        return contract
+
+    def group_cores(self, module_list, offset):
+        """
+            Returns list of cores to be merged for boundary MPS method
+
+            Args:
+            module_list (List): one module list containing left input region, output region and right input region
+            offset: must be 0 or 1, used to merge odd and even bond dimensions
+        """
+        # TODO: handle num cores on LHS and RHS not equal (doesn't occur in CIFAR-10 and MNIST sets)
+        # group sites to merge
+        core_num = 0  # 0 and 2 are right and left input regions, 1 is output region
+        core_groups = []
+        merge_with_output = None
+        extra_core = None
+        for core in module_list:
+            if core_num == 0:
+                if offset == 0:
+                    num_sites = core.size()[1]
+                if offset == 1:
+                    num_sites = core.size()[1] - 1
+                parity = num_sites % 2
+                if parity != 0:
+                    # if odd number of sites, ignore first site of left region or last site of right region to make even
+                    core = core[:, :-1]
+                    extra_core = core[:, 0]
+                    lone_core = 'first'
+                even_cores, odd_cores = core[:, 0::2], core[:, 1::2]
+
+                # if even and odd cores are same length
+                if even_cores.size()[1] == odd_cores.size()[1]:
+                    for i in range(even_cores.shape[1]):
+                        group = [even_cores[:, i], odd_cores[:, i]]
+                        core_groups.append(group)
+                # if even and odd cores are not same length keep first extra even core to merge with output core
+                if even_cores.shape[1] != odd_cores.shape[1]:
+                    for i in range(even_cores.shape[1]):
+                        if i == odd_cores.shape[1]:
+                            merge_with_output = even_cores[:, i]
+                        else:
+                            group = [even_cores[:, i], odd_cores[:, i]]
+                            core_groups.append(group)
+
+            if core_num == 1:
+                if not merge_with_output is None:
+                    group = [merge_with_output, core]
+                    core_groups.append(group)
+                    # set idx of merge with output node
+                    output_idx = len(core_groups) - 1
+                    merge_with_output = None
+                else:
+                    merge_with_output = core
+
+            if core_num == 2:
+                if not merge_with_output is None:
+                    group = [core[:, 0], merge_with_output]
+                    core_groups.append(group)
+                    # set idx of merge with output node
+                    output_idx = len(core_groups) - 1
+                    # remove grouped core from the list
+                    core = core[:, 1:]
+
+                even_cores, odd_cores = core[:, 0::2], core[:, 1::2]
+                # if even and odd cores are same length
+                if even_cores.shape[1] == odd_cores.shape[1]:
+                    for i in range(even_cores.shape[1]):
+                        group = [even_cores[:, i], odd_cores[:, i]]
+                        core_groups.append(group)
+                # if even and odd cores are not same length ignore last extra even core
+                if even_cores.shape[1] != odd_cores.shape[1]:
+                    for i in range(even_cores.shape[1]):
+                        if i == odd_cores.shape[1]:
+                            # check extra core not set and set it
+                            assert extra_core is None
+                            extra_core = even_cores[:, i]
+                            lone_core = 'last'
+                        else:
+                            group = [even_cores[:, i], odd_cores[:, i]]
+                            core_groups.append(group)
+            core_num += 1
+        return core_groups, output_idx, extra_core, lone_core
+
+    def merge(self, module_list, offset, with_output=False):
+        """
+            Returns:
+                merged_cores_list (List): list containing each merged core
+                idx_merged_with_output (Int): index of the merged tensor containing the output region
+                extra_core (Tensor): tensor that was left over after merging (not merged with any other core)
+                extra_core_loc (Str): 'top' or 'bottom' whichever core was left out
+
+            Args:
+                module_list (List): one module list containing left input region, output region and right input region
+                offset: must be 0 or 1, used to merge odd and even bond dimensions
+                with_output: a flag indicating the presence of the output tensor dimension on the output region
+        """
+        grouped_core_list, idx_with_output_core, extra_core, extra_core_loc = self.group_cores(module_list, offset)
+        # merge cores
+        merged_cores_list = []
+        for i in range(len(grouped_core_list)):
+            if i == idx_with_output_core:
+                if offset == 0:
+                    if with_output:
+                        merge = torch.einsum("suri, loud->slroid", grouped_core_list[i][0], grouped_core_list[i][1])
+                    else:
+                        merge = torch.einsum("suri, lud->slrid", grouped_core_list[i][0], grouped_core_list[i][1])
+                if offset == 1:
+                    if with_output:
+                        merge = torch.einsum("suri, ould->slroid", grouped_core_list[i][0], grouped_core_list[i][1])
+                    else:
+                        merge = torch.einsum("suri, uld->slrid", grouped_core_list[i][0], grouped_core_list[i][1])
+                # indiacte where output core is merged
+                idx_merged_with_output = len(merged_cores_list)
+            else:
+                if offset == 0:
+                    merge = torch.einsum("slui, surj->slrij", grouped_core_list[i][0], grouped_core_list[i][1])
+                if offset == 1:
+                    merge = torch.einsum("suli, surj->slrij", grouped_core_list[i][0], grouped_core_list[i][1])
+            merged_cores_list.append(merge)
+
+        return merged_cores_list, idx_merged_with_output, extra_core, extra_core_loc
+
+    def unmerge(self, merged_cores_list, idx_merged_with_output, max_bd, extra_core, extra_core_loc, with_output=False):
+        """
+            Returns:
+                unmerged_module: (Module): one module with left and right input regions and output region, unmerged
+
+            Args:
+                merged_cores_list (List): list containing each merged core
+                idx_merged_with_output (Int): index of the merged tensor containing the output region
+                max_bd (Int): maximum allowed bond dimension
+                extra_core (Tensor): tensor that was left over after merging (not merged with any other core)
+                extra_core_loc (Str): 'top' or 'bottom' whichever core was left out
+                with_output: a flag indicating the presence of the output tensor dimension on the output region
+        """
+        unmerged_list = []
+        if extra_core_loc == 'first':
+            extra_core = extra_core[:, :2]
+            unmerged_list.append(extra_core)
+
+        for i in range(len(merged_cores_list)):
+            # unmerged cores, put cores in list
+            merged_core = merged_cores_list[i]
+            if with_output:
+                try:
+                    merged_core = torch.einsum('slrij->slirj', merged_core)
+                except:
+                    merged_core = torch.einsum('slroij->solirj', merged_core)
+            else:
+                merged_core = torch.einsum('slrij->slirj', merged_core)
+            left_dim = merged_core.size()[1] * merged_core.size()[2]
+            right_dim = merged_core.size()[3] * merged_core.size()[4]
+
+            if i == idx_merged_with_output:
+                if with_output:
+                    core1 = torch.zeros((merged_core.size()[1], merged_core.size()[2], merged_core.size()[3], max_bd))
+                    core2 = torch.zeros((merged_core.size()[0], max_bd, merged_core.size()[4], merged_core.size()[5]))
+                else:
+                    core1 = torch.zeros((merged_core.size()[0], merged_core.size()[1], merged_core.size()[2], max_bd))
+                    core2 = torch.zeros((max_bd, merged_core.size()[3], merged_core.size()[4]))
+
+                for j in range(merged_core.shape[0]):
+                    # svd
+                    # print(f'the core: {merged_core[j, :, :, :, :].shape}')
+                    try:
+                        u, d, vt = torch.svd(merged_core[j, :, :, :, :].reshape((left_dim, right_dim)))
+                    except:
+                        u, d, vt = torch.svd(
+                            merged_core[j, :, :, :, :, :].reshape((left_dim * merged_core.size()[3], right_dim)))
+
+                    v = vt.T
+                    # truncate
+                    d, _ = torch.sort(d, descending=True)
+                    d = d[:max_bd]
+                    u = u[:, :max_bd]
+                    v = v[:max_bd]
+                    # print(u.shape, v.shape, d.shape)
+                    # seperate into 2 cores
+                    root_d = torch.sqrt(d)
+                    c1 = torch.einsum('lr, r->lr', u, root_d)
+                    c2 = torch.einsum('l, lr->lr', root_d, v)
+
+                    # reshape
+                    try:
+                        c1 = c1.reshape((merged_core.size()[1], merged_core.size()[2], max_bd))
+                        c2 = c2.reshape((max_bd, merged_core.size()[3], merged_core.size()[4]))
+                        core1[j] = c1
+                        if j == 0:
+                            core2 = c2
+                    except:
+                        c1 = c1.reshape((merged_core.size()[1], merged_core.size()[2], merged_core.size()[3], max_bd))
+                        c2 = c2.reshape((max_bd, merged_core.size()[4], merged_core.size()[5]))
+                        core1 = c1
+                        core2[j] = c2
+            else:
+                core1 = torch.zeros((merged_core.size()[0], merged_core.size()[1], merged_core.size()[2], max_bd))
+                core2 = torch.zeros((merged_core.size()[0], max_bd, merged_core.size()[3], merged_core.size()[4]))
+                for j in range(merged_core.size()[0]):
+                    # svd
+                    # print(f'the core: {merged_core[j, :, :, :, :].shape}')
+                    u, d, vt = torch.svd(merged_core[j, :, :, :, :].reshape((left_dim, right_dim)))
+                    v = vt.T
+                    # truncate
+                    d, _ = torch.sort(d, descending=True)
+                    d = d[:max_bd]
+                    u = u[:, :max_bd]
+                    v = v[:max_bd]
+                    # print(u.size(), v.size(), d.size())
+                    # seperate into 2 cores
+                    root_d = torch.sqrt(d)
+                    c1 = torch.einsum('lr, r->lr', u, root_d)
+                    c2 = torch.einsum('l, lr->lr', root_d, v)
+
+                    # reshape
+                    c1 = c1.reshape((merged_core.size()[1], merged_core.size()[2], max_bd))
+                    c2 = c2.reshape((max_bd, merged_core.size()[3], merged_core.size()[4]))
+                    core1[j] = c1
+                    core2[j] = c2
+            unmerged_list.append(core1)
+            unmerged_list.append(core2)
+
+        # rearrange indicies
+        for i in range(1, len(unmerged_list), 2):
+            if len(unmerged_list[i].size()) == 3:
+                unmerged_list[i] = torch.einsum("lrd->rld", unmerged_list[i])
+            else:
+                unmerged_list[i] = torch.einsum("blrd->brld", unmerged_list[i])
+
+        if extra_core_loc == 'last':
+            unmerged_list.append(extra_core[:, :, :2])
+
+        # put back into modules
+        num_cores = (len(unmerged_list) - 1) // 2
+        unmerge_left = torch.zeros((unmerged_list[1].size()[0], num_cores, unmerged_list[1].size()[1],
+                                    unmerged_list[1].size()[2], unmerged_list[1].size()[3]))
+        unmerge_right = torch.zeros((unmerged_list[0].size()[0], num_cores, unmerged_list[0].size()[1],
+                                     unmerged_list[0].size()[2], unmerged_list[0].size()[3]))
+        core_count = 0
+        for i in range(len(unmerged_list)):
+            if len(unmerged_list[i].size()) == 3:
+                output = unmerged_list[i]
+            elif with_output and unmerged_list[i].size()[0] == self.num_classes:
+                output = unmerged_list[i]
+            else:
+                if core_count < num_cores:
+                    unmerge_left[:, core_count] = unmerged_list[i]
+                else:
+                    idx = core_count - num_cores
+                    unmerge_right[:, idx] = unmerged_list[i]
+                core_count += 1
+        unmerged_module = [unmerge_left, output, unmerge_right]
+        return unmerged_module
+
+    def contract(self, mps, mpo_list, stop, idx, direction):
+        left = self.contract_mps_mpo(mps[0], mpo_list[idx][0])
+        middle = torch.einsum("abc, adef->bdcef", mps[1], mpo_list[idx][1])
+        middle = middle.reshape((-1, middle.size()[2], middle.size()[3], middle.size()[4]))
+        middle = middle.reshape((middle.size()[0], -1, middle.size()[3]))
+        right = self.contract_mps_mpo(mps[2], mpo_list[idx][2])
+
+        contracted_module = [left, middle, right]
+
+        merge1, merge1_output_idx, extra_core, extra_core_loc = self.merge(contracted_module, offset=0)
+        unmerge1 = self.unmerge(merge1, merge1_output_idx, 2, extra_core, extra_core_loc)
+        merge2, merge2_output_idx, extra_core, extra_core_loc = self.merge(unmerge1, offset=1)
+        unmerge2 = self.unmerge(merge2, merge2_output_idx, 2, extra_core, extra_core_loc)
+
+        if direction == 'top':
+            idx += 1
+        else:
+            idx -= 1
+        if idx == stop:
+            return unmerge2
+        else:
+            return self.contract(unmerge2, mpo_list, stop, idx, direction)
+
+    def final_contract(self, top, bottom, output_mpo):
+        # contract top with output mpo
+        left = self.contract_mps_mpo(top[0], output_mpo[0])
+        middle = torch.einsum("abc, adoef->bdocef", top[1], output_mpo[1])
+        middle = middle.reshape((-1, middle.size()[2], middle.size()[3], middle.size()[4], middle.size(5)))
+        middle = middle.reshape((middle.size()[0], middle.size()[1], -1, middle.size()[4]))
+        right = self.contract_mps_mpo(top[2], output_mpo[2])
+
+        module = [left, middle, right]
+
+        merge1, merge1_output_idx, extra_core, extra_core_loc = self.merge(module, offset=0, with_output=True)
+        unmerge1 = self.self.unmerge(merge1, merge1_output_idx, 2, extra_core, extra_core_loc, with_output=True)
+        merge2, merge2_output_idx, extra_core, extra_core_loc = self.merge(unmerge1, offset=1, with_output=True)
+        unmerge2 = self.unmerge(merge2, merge2_output_idx, 2, extra_core, extra_core_loc, with_output=True)
+
+        # mps contraction
+        cores = bottom[0].size()[1]
+        l = bottom[0].size()[3] ** 2
+        r = bottom[0].size()[4] ** 2
+
+        # left
+        contract = torch.zeros((bottom[0].size()[0], cores, l, r))
+        for i in range(bottom[0].size()[1]):
+            result = torch.einsum("bupq, bust->bpsqt", bottom[0][:, i, :, :, :], unmerge2[0][:, i, :, :, :])
+            # merge right bond dims
+            result = result.reshape((result.size()[0], -1, result.size()[3], result.size()[4]))
+            # merge left bond dims
+            result = result.reshape((result.size()[0], result.size()[1], -1))
+            contract[:, i, :, :] = result
+        left = contract
+
+        # right
+        contract = torch.zeros((bottom[2].size()[0], cores, l, r))
+        for i in range(bottom[2].size()[1]):
+            result = torch.einsum("bupq, bust->bpsqt", bottom[2][:, i, :, :, :], unmerge2[2][:, i, :, :, :])
+            # merge right bond dims
+            result = result.reshape((result.size()[0], -1, result.size()[3], result.size()[4]))
+            # merge left bond dims
+            result = result.reshape((result.size()[0], result.size()[1], -1))
+            contract[:, i, :, :] = result
+        right = contract
+
+        # middle
+        middle = torch.einsum("abc, oade->bdoce", bottom[1], unmerge2[1])
+        middle = middle.reshape((-1, middle.size()[2], middle.size()[3], middle.size()[4]))
+        middle = middle.reshape((middle.size()[0], middle.size()[1], -1))
+
+        return [left, middle, right]
 
     def core_len(self):
         """
@@ -1281,7 +1625,6 @@ class MergedLinearRegion(LinearRegion):
         we're currently merging (merging=True) or unmerging (merging=False),
         either return a new core, or None if no rule exists for this context
         """
-
         # Combine an OutputSite with a stray InputSite, return a MergedOutput
         if merging and (
             (isinstance(left_core, OutputSite) and isinstance(right_core, InputSite))
@@ -1411,6 +1754,7 @@ class InputRegion(nn.Module):
         merge may have 1, 2, or 3 entries, with the majority of sites ending in
         a MergedInput instance
         """
+        print(f'merge inputRegion ln:1448')
         assert offset in [0, 1]
         num_sites = self.core_len()
         parity = num_sites % 2
@@ -1435,6 +1779,9 @@ class InputRegion(nn.Module):
 
             # Multiply all pairs of cores, keeping inputs separate
             merged_cores = torch.einsum("slui,surj->slrij", [even_cores, odd_cores])
+            print(f'unsplit: {tensor.size()}')
+            print(f'even core: {even_cores.size()}, odd core: {odd_cores.size()}')
+            print(f'merged input site core size: {merged_cores.size()} ln:1473')
             out_list = [MergedInput(merged_cores)]
 
         # Remove empty MergedInputs, which appear in very small InputRegions
@@ -1530,9 +1877,10 @@ class InputRegionPEPSEdge(nn.Module):
         # Check that input_data has the correct shape
         tensor = self.tensor
         assert len(input_data.shape) == 3
+        print(input_data.shape)
         assert input_data.size(1) == len(self)
 
-        # Contract the input with our core tensor
+        # Contract the input with our core tensor (b=batch size, s=num of tensor sites)
         mats = torch.einsum("sulri,bsi->bsulr", [tensor, input_data])
 
         # If we're using bias matrices, add those here
@@ -1802,7 +2150,6 @@ class InputSite(nn.Module):
         Args:
             input_data (Tensor): Input with shape [batch_size, feature_dim]
         """
-        print('FORWARD input site (1636)')
         # Check that input_data has the correct shape
         tensor = self.tensor
         assert len(input_data.shape) == 2
@@ -1878,7 +2225,7 @@ class OutputSite(nn.Module):
 
 class OutputSitePeps(nn.Module):
     """
-    A single MPS core with no input and a single output index, bond_str = 'oulr' or 'oulrd' for the central MPS
+    A single MPS core with no input and a single output index, bond_str = 'ulrd' or 'oulrd' for the central MPS
     A single MPS core with no input and no output index, bond_str = 'ulr' or 'ulrd' for the rest of the MPS
     """
 
@@ -1946,7 +2293,6 @@ class MergedOutput(nn.Module):
         Args:
             input_data (Tensor): Input with shape [batch_size, feature_dim]
         """
-        print('FORWARD merged output (1745)')
         # Check that input_data has the correct shape
         tensor = self.tensor
         assert len(input_data.shape) == 2

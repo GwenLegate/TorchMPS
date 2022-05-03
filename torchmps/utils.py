@@ -83,7 +83,9 @@ def svd_flex(tensor, svd_string, max_D=None, cutoff=1e-10, sv_right=True, sv_vec
         tensor = tensor.view([left_dim, right_dim])
 
         # Get SVD and format so that left_mat * diag(svs) * right_mat = tensor
+        print(f'tensor: {tensor.size()}')
         left_mat, svs, right_mat = torch.svd(tensor)
+        print(f'left mat: {left_mat.size()}, right mat: {right_mat.size()}')
         svs, _ = torch.sort(svs, descending=True)
         right_mat = torch.t(right_mat)
 
@@ -144,6 +146,7 @@ def svd_flex(tensor, svd_string, max_D=None, cutoff=1e-10, sv_right=True, sv_vec
         left_tensor = left_mat.view(left_shape + [max_D])
         right_tensor = right_mat.view([max_D] + right_shape)
 
+
         # Finally, permute the indices into the desired order
         if left_str != left_part + bond_char:
             left_tensor = torch.einsum(
@@ -153,7 +156,6 @@ def svd_flex(tensor, svd_string, max_D=None, cutoff=1e-10, sv_right=True, sv_vec
             right_tensor = torch.einsum(
                 f"{bond_char+right_part}->{right_str}", [right_tensor]
             )
-
         return left_tensor, right_tensor, truncation
 
 

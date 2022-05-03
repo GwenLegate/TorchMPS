@@ -9,21 +9,21 @@ torch.manual_seed(0)
 start_time = time.time()
 
 # MPS parameters
-bond_dim = 13
-adaptive_mode = False
+bond_dim = 7
+adaptive_mode = True
 periodic_bc = False
 
 # Training parameters
 #input_dim = 32 ** 2 # cifar
 input_dim = 28 ** 2 # MNIST
-num_train = 50000 # 60000 MNIST, 50000 cifar
+num_train = 60000 # 60000 MNIST, 50000 cifar
 num_test = 10000
 batch_size = 100
 num_epochs = 1
 learn_rate = 1e-5
 l2_reg = 0.0
 feature_dim = 2
-embedding = 2
+embedding = 1
 
 # Initialize the MPS module
 mps = MPS(
@@ -50,7 +50,14 @@ loss_fun = torch.nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(mps.parameters(), lr=learn_rate, weight_decay=l2_reg)
 
 # Get the training and test sets
-transform = transforms.ToTensor()
+#transform = transforms.ToTensor()
+transform = transforms.Compose([transforms.Grayscale(), transforms.ToTensor()]) # for cifar geayscale
+'''transform = torch.nn.Sequential(
+    transforms.Grayscale(),
+    transforms.ToTensor(),
+)'''
+
+
 #MNIST
 train_set = datasets.MNIST("./mnist", download=True, transform=transform)
 test_set = datasets.MNIST("./mnist", download=True, transform=transform, train=False)
@@ -100,7 +107,10 @@ for epoch_num in range(1, num_epochs + 1):
         try:
             inputs, labels = inputs.view([batch_size, 28 ** 2]).to(device), labels.data.to(device)
         except:
-            inputs, labels = inputs.view([batch_size, 32 ** 2, 3]).to(device), labels.data.to(device)
+            try:
+                inputs, labels = inputs.view([batch_size, 32 ** 2]).to(device), labels.data.to(device)
+            except:
+                inputs, labels = inputs.view([batch_size, 32 ** 2, 3]).to(device), labels.data.to(device)
 
         # Call our MPS to get logit scores and predictions
         scores = mps(inputs, embedding)
@@ -130,8 +140,10 @@ for epoch_num in range(1, num_epochs + 1):
             try:
                 inputs, labels = inputs.view([batch_size, 28 ** 2]).to(device), labels.data.to(device)
             except:
-                inputs, labels = inputs.view([batch_size, 32 ** 2, 3]).to(device), labels.data.to(device)
-
+                try:
+                    inputs, labels = inputs.view([batch_size, 32 ** 2]).to(device), labels.data.to(device)
+                except:
+                    inputs, labels = inputs.view([batch_size, 32 ** 2, 3]).to(device), labels.data.to(device)
 
             # Call our MPS to get logit scores and predictions
             scores = mps(inputs, embedding)
