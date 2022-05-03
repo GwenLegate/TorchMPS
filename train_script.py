@@ -9,7 +9,7 @@ torch.manual_seed(0)
 start_time = time.time()
 
 # MPS parameters
-bond_dim = 7
+bond_dim = 9
 adaptive_mode = True
 periodic_bc = False
 
