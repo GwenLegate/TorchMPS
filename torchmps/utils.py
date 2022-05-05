@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from math import sqrt
 
 
 def svd_flex(tensor, svd_string, max_D=None, cutoff=1e-10, sv_right=True, sv_vec=None):
@@ -251,7 +252,7 @@ def init_tensor(shape, bond_str, init_method):
 
     return tensor
 
-def init_mps_for_peps_tensor(shape, bond_str, type):
+def init_mps_for_peps_tensor(shape, bond_str, type, num_cores):
     """
     Initialize a tensor with a given shape
 
@@ -277,8 +278,9 @@ def init_mps_for_peps_tensor(shape, bond_str, type):
         bond_chars = ["d"]
         assert all([c not in bond_str for c in bond_chars])
 
-    std = 1e-9
-    return std * torch.randn(shape)
+    std = 1e-6
+    # scale by sqrt of the inverse of input sites to avoid vainshing gradient
+    return std * torch.randn(shape) * sqrt(1 / (num_cores))
 
 ### OLDER MISCELLANEOUS FUNCTIONS ###   # noqa: E266
 

@@ -17,8 +17,8 @@ input_dim = 28 # MNIST
 num_train = 60000 # 60000 MNIST, 50000 cifar
 num_test = 10000
 batch_size = 100
-num_epochs = 10
-learn_rate = 1e-8
+num_epochs = 5
+learn_rate = 1e-4
 l2_reg = 0.0
 feature_dim = 2
 embedding = 0
@@ -102,13 +102,16 @@ for epoch_num in range(1, num_epochs + 1):
 
         # Compute the loss and accuracy, add them to the running totals
         loss = loss_fun(scores, labels)
+        print(f'106: loss {loss}')
         with torch.no_grad():
             accuracy = torch.sum(preds == labels).item() / batch_size
+            print(f'109: acc {accuracy}')
             running_loss += loss
             running_acc += accuracy
 
         # Backpropagate and update parameters
         optimizer.zero_grad()
+        #torch.autograd.set_detect_anomaly(True)
         loss.backward()
         optimizer.step()
 
